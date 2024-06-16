@@ -33,6 +33,17 @@ type DomainAcme struct {
 	AccountKey *rsa.PrivateKey `json:"account_key"`
 	CertFile   string          `json:"cert_file"`
 	KeyFile    string          `json:"key_file"`
+	ExpireDate time.Time       `json:"expire_date"`
+}
+
+func (d *DomainAcme) IsNull() bool {
+	// check is domain acme data is null or not
+	return d.IssuerData.Ca == "" && d.IssuerData.URL == "" && d.IssuerData.ChallengeToken == "" && d.AccountKey == nil
+}
+
+// Expired is a method for checking certificate is expired or not
+func (d *DomainAcme) Expired() bool {
+	return time.Now().After(d.ExpireDate)
 }
 
 // IssuerData is a struct for issuer data
@@ -211,14 +222,30 @@ func (m *Manager) issueLetsEncryptCert(email, domain, location string) {
 		}
 	}
 
-	// create domainAcme struct
-	domainAcme := DomainAcme{
-		Sans: []string{domain},
-		IssuerData: IssuerData{
-			URL: acct.URI,
-			Ca:  client.DirectoryURL,
-		},
-		AccountKey: accountKey,
+	// read domainAcme.json file
+	acmefile, err := os.ReadFile(domainAcmeFile)
+	if err != nil {
+		log.Fatalf("Failed to read domain acme file: %v", err)
+	}
+
+	var domainAcme DomainAcme
+	json.Unmarshal(acmefile, &domainAcme)
+
+	if domainAcme.IsNull() {
+		// create domainAcme struct
+		domainAcme = DomainAcme{
+			Sans: []string{domain},
+			IssuerData: IssuerData{
+				URL: acct.URI,
+				Ca:  client.DirectoryURL,
+			},
+			AccountKey: accountKey,
+		}
+	}
+
+	if !domainAcme.Expired() {
+		log.Println("Certificate is not expired: " + domain)
+		return
 	}
 
 	// save domainAcme struct to domainAcme.json file
@@ -359,6 +386,20 @@ func (m *Manager) issueLetsEncryptCert(email, domain, location string) {
 
 	domainAcme.CertFile = string(crtFileData)
 	domainAcme.KeyFile = string(keyFileData)
+
+	// normally letsencrypt certificate expires in 90 days
+	// but we will set it to 88 days to renew it before it expires
+	domainAcme.ExpireDate = time.Now().AddDate(0, 0, 88)
+
+	// save domainAcme struct to domainAcme.json file
+	jsonData, err = json.Marshal(domainAcme)
+	if err != nil {
+		log.Fatalf("Failed to marshal domain acme data: %v", err)
+	}
+
+	if err := os.WriteFile(domainAcmeFile, jsonData, 0644); err != nil {
+		log.Fatalf("Failed to write domain acme data: %v", err)
+	}
 
 	fmt.Println("Certificate and key saved to cert.pem and key.pem")
 }
