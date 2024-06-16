@@ -11,6 +11,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -113,17 +114,17 @@ func (m *Manager) GetCert(hello *tls.ClientHelloInfo) (*tls.Certificate, error) 
 
 	certFileData, err := os.ReadFile(file)
 	if err != nil {
-		log.Fatalf("Failed to read certificate file: %v", err)
+		return nil, errors.New("Failed to read certificate file " + err.Error())
 	}
 
 	keyFileData, err := os.ReadFile(key)
 	if err != nil {
-		log.Fatalf("Failed to read key file: %v", err)
+		return nil, errors.New("Failed to read key file " + err.Error())
 	}
 
 	cert, err := tls.X509KeyPair(certFileData, keyFileData)
 	if err != nil {
-		log.Fatalf("Failed to get x509 key pair: %v", err)
+		return nil, errors.New("Failed to get x509 key pair " + err.Error())
 	}
 
 	return &cert, nil
