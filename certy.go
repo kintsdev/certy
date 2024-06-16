@@ -80,16 +80,15 @@ func (m *Manager) GetCert(hello *tls.ClientHelloInfo) (*tls.Certificate, error) 
 }
 
 // HTTPHandler is a http handler for serving acme challenge
-func (m *Manager) HTTPHandler(w http.ResponseWriter, r *http.Request) {
-	domain := r.Host
-	token := r.URL.Path[len("/.well-known/acme-challenge/"):]
-	challengeToken := m.GetChallengeToken(domain)
-
-	if token == challengeToken {
-		w.Write([]byte(challengeToken))
-	} else {
-		http.NotFound(w, r)
-	}
+func (m *Manager) HTTPHandler(fallback http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token := r.URL.Path[len("/.well-known/acme-challenge/"):]
+		if token == m.GetChallengeToken(r.Host) {
+			w.Write([]byte(m.GetChallengeToken(r.Host)))
+		} else {
+			fallback.ServeHTTP(w, r)
+		}
+	})
 }
 
 func IssueLetsEncryptCert(email, domain, location string) {
