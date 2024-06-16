@@ -223,7 +223,7 @@ func (m *Manager) issueLetsEncryptCert(email, domain, location string) {
 	var domainAcme DomainAcme
 	json.Unmarshal(acmefile, &domainAcme)
 
-	if !domainAcme.IsNull() && !domainAcme.Expired() {
+	if !domainAcme.IsNull() && !domainAcme.ExpireDate.IsZero() {
 		log.Println("Certificate is not expired: " + domain)
 		return
 	}
