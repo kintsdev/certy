@@ -1,3 +1,8 @@
+<p align="center">
+  <img src="./certy.png" alt="Certy" width="200" height="200">
+</p>
+
+
 # WIP: Certy
 
 [![Go Report Card](https://goreportcard.com/badge/github.com/kintsdev/certy)](https://goreportcard.com/report/github.com/kintsdev/certy)
