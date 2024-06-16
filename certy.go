@@ -15,6 +15,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"golang.org/x/crypto/acme"
@@ -82,8 +83,8 @@ func (m *Manager) GetCert(hello *tls.ClientHelloInfo) (*tls.Certificate, error) 
 // HTTPHandler is a http handler for serving acme challenge
 func (m *Manager) HTTPHandler(fallback http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// check if request path is acme challenge
-		if r.URL.Path[:len("/.well-known/acme-challenge/")] != "/.well-known/acme-challenge/" {
+		// check if request path is has acme challenge
+		if !strings.HasPrefix(r.URL.Path, "/.well-known/acme-challenge/") {
 			fallback.ServeHTTP(w, r)
 			return
 		}
