@@ -84,11 +84,28 @@ func (m *Manager) GetChallengeToken(domain string) string {
 
 // GetCert is a method for getting tls certificate
 func (m *Manager) GetCert(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-	// m.Location + "/" + domain + "/" + domain + "-cert.crt"
-	location := fmt.Sprintf("%s/%s/%s-cert.crt", m.Location, hello.ServerName, hello.ServerName)
-	cert, err := tls.LoadX509KeyPair(location, location)
+	domain := hello.ServerName
+	location := fmt.Sprintf("%s/%s/%s-acme.json", m.Location, domain, domain)
+	file := fmt.Sprintf("%s/%s/%s-cert.crt", m.Location, domain, domain)
+	key := fmt.Sprintf("%s/%s/%s-key.pem", m.Location, domain, domain)
+
+	if _, err := os.Stat(location); os.IsNotExist(err) {
+		m.IssueCert(domain)
+	}
+
+	certFileData, err := os.ReadFile(file)
 	if err != nil {
-		return nil, err
+		log.Fatalf("Failed to read certificate file: %v", err)
+	}
+
+	keyFileData, err := os.ReadFile(key)
+	if err != nil {
+		log.Fatalf("Failed to read key file: %v", err)
+	}
+
+	cert, err := tls.X509KeyPair(certFileData, keyFileData)
+	if err != nil {
+		log.Fatalf("Failed to get x509 key pair: %v", err)
 	}
 
 	return &cert, nil
