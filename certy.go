@@ -34,11 +34,12 @@ type DomainAcme struct {
 	CertFile   string          `json:"cert_file"`
 	KeyFile    string          `json:"key_file"`
 	ExpireDate time.Time       `json:"expire_date"`
+	IssueDate  time.Time       `json:"issue_date"`
 }
 
 func (d *DomainAcme) IsNull() bool {
 	// check is domain acme data is null or not
-	return d.IssuerData.Ca == "" && d.IssuerData.URL == "" && d.IssuerData.ChallengeToken == "" && d.AccountKey == nil
+	return d.IssuerData.Ca == "" && d.IssuerData.URL == "" && d.IssuerData.ChallengeToken == "" && d.AccountKey == nil && d.IssueDate.IsZero()
 }
 
 // Expired is a method for checking certificate is expired or not
@@ -223,8 +224,8 @@ func (m *Manager) issueLetsEncryptCert(email, domain, location string) {
 	var domainAcme DomainAcme
 	json.Unmarshal(acmefile, &domainAcme)
 
-	if !domainAcme.IsNull() && !domainAcme.ExpireDate.IsZero() {
-		log.Println("Certificate is not expired: " + domain)
+	if !domainAcme.IsNull() {
+		log.Println("Domain acme data is not null: " + domain)
 		return
 	}
 
@@ -292,9 +293,9 @@ func (m *Manager) issueLetsEncryptCert(email, domain, location string) {
 	}
 
 	domainAcme.IssuerData.ChallengeToken = chal.Token
+	log.Println("Challenge token: " + chal.Token)
 
 	// save domainAcme struct to domainAcme.json file
-
 	jsonData, err = json.Marshal(domainAcme)
 	if err != nil {
 		log.Fatalf("Failed to marshal domain acme data: %v", err)
