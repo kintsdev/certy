@@ -37,6 +37,12 @@ type DomainAcme struct {
 	IssueDate  time.Time       `json:"issue_date"`
 }
 
+// Check is need renew certificate or not
+func (d *DomainAcme) RenewRequired() bool {
+	// check is need renew certificate or not
+	return time.Now().After(d.ExpireDate.AddDate(0, 0, -2))
+}
+
 func (d *DomainAcme) IsNull() bool {
 	// check is domain acme data is null or not
 	return d.IssuerData.Ca == "" && d.IssuerData.URL == "" && d.IssuerData.ChallengeToken == "" && d.AccountKey == nil && d.IssueDate.IsZero()
@@ -177,20 +183,6 @@ func (m *Manager) HTTPHandler(fallback http.Handler) http.Handler {
 
 // issueLetsEncryptCert is a function for issuing letsencrypt certificate
 func (m *Manager) issueLetsEncryptCert(email, domain, location string) {
-	// Generate a new account key
-	accountKey, err := rsa.GenerateKey(rand.Reader, 4096)
-	if err != nil {
-		log.Fatalf("Account key generation failed: %v", err)
-	}
-
-	client := &acme.Client{
-		DirectoryURL: acme.LetsEncryptURL,
-		Key:          accountKey,
-	}
-
-	if m.Staging {
-		client.DirectoryURL = letsencryptStagingURL
-	}
 
 	// check location is exists or not if not create it
 	if _, err := os.Stat(location); os.IsNotExist(err) {
@@ -224,9 +216,26 @@ func (m *Manager) issueLetsEncryptCert(email, domain, location string) {
 	var domainAcme DomainAcme
 	json.Unmarshal(acmefile, &domainAcme)
 
-	if !domainAcme.IsNull() {
-		log.Println("Domain acme data is not null: " + domain)
+	if !domainAcme.RenewRequired() {
+		log.Println("Certificate is not required to renew: " + domain)
+		log.Println("Expire date: " + domainAcme.ExpireDate.String())
+		log.Println("Renew date: " + domainAcme.ExpireDate.AddDate(0, 0, -2).String())
 		return
+	}
+
+	// Generate a new account key
+	accountKey, err := rsa.GenerateKey(rand.Reader, 4096)
+	if err != nil {
+		log.Fatalf("Account key generation failed: %v", err)
+	}
+
+	client := &acme.Client{
+		DirectoryURL: acme.LetsEncryptURL,
+		Key:          accountKey,
+	}
+
+	if m.Staging {
+		client.DirectoryURL = letsencryptStagingURL
 	}
 
 	// Register a new ACME account
