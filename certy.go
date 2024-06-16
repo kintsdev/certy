@@ -396,6 +396,7 @@ func (m *Manager) issueLetsEncryptCert(email, domain, location string) {
 	// normally letsencrypt certificate expires in 90 days
 	// but we will set it to 88 days to renew it before it expires
 	domainAcme.ExpireDate = time.Now().AddDate(0, 0, 88)
+	domainAcme.IssueDate = time.Now()
 
 	// save domainAcme struct to domainAcme.json file
 	jsonData, err = json.Marshal(domainAcme)
