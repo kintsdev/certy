@@ -46,21 +46,23 @@ type IssuerData struct {
 type Manager struct {
 	Email    string
 	Location string
+	Staging  bool
 }
 
 // NewManager is a constructor for Manager struct
 // email: email for letsencrypt account
 // location: location to store acme data and certificates
-func NewManager(email, location string) *Manager {
+func NewManager(email, location string, staging bool) *Manager {
 	return &Manager{
 		Email:    email,
 		Location: location,
+		Staging:  staging,
 	}
 }
 
 // IssueCert is a method for issuing letsencrypt certificate
 func (m *Manager) IssueCert(domain string) {
-	IssueLetsEncryptCert(m.Email, domain, m.Location)
+	m.issueLetsEncryptCert(m.Email, domain, m.Location)
 }
 
 // GetChallengeToken is a method for getting challenge token
@@ -144,8 +146,8 @@ func (m *Manager) HTTPHandler(fallback http.Handler) http.Handler {
 	})
 }
 
-// IssueLetsEncryptCert is a function for issuing letsencrypt certificate
-func IssueLetsEncryptCert(email, domain, location string) {
+// issueLetsEncryptCert is a function for issuing letsencrypt certificate
+func (m *Manager) issueLetsEncryptCert(email, domain, location string) {
 	// Generate a new account key
 	accountKey, err := rsa.GenerateKey(rand.Reader, 4096)
 	if err != nil {
@@ -157,7 +159,7 @@ func IssueLetsEncryptCert(email, domain, location string) {
 		Key:          accountKey,
 	}
 
-	if os.Getenv("ACME_ENV") == "staging" {
+	if m.Staging {
 		client.DirectoryURL = letsencryptStagingURL
 	}
 
