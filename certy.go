@@ -26,22 +26,31 @@ const (
 	letsencryptProdURL    = "https://acme-v02.api.letsencrypt.org/directory"
 )
 
+// DomainAcme is a struct for domain acme data
 type DomainAcme struct {
-	Sans       []string   `json:"sans"`
-	IssuerData IssuerData `json:"issuer_data"`
+	Sans       []string        `json:"sans"`
+	IssuerData IssuerData      `json:"issuer_data"`
+	AccountKey *rsa.PrivateKey `json:"account_key"`
+	CertFile   string          `json:"cert_file"`
+	KeyFile    string          `json:"key_file"`
 }
 
+// IssuerData is a struct for issuer data
 type IssuerData struct {
 	URL            string `json:"url"`
 	Ca             string `json:"ca"`
 	ChallengeToken string `json:"challenge_token"`
 }
 
+// Manager is a struct for managing certificates
 type Manager struct {
 	Email    string
 	Location string
 }
 
+// NewManager is a constructor for Manager struct
+// email: email for letsencrypt account
+// location: location to store acme data and certificates
 func NewManager(email, location string) *Manager {
 	return &Manager{
 		Email:    email,
@@ -49,10 +58,12 @@ func NewManager(email, location string) *Manager {
 	}
 }
 
+// IssueCert is a method for issuing letsencrypt certificate
 func (m *Manager) IssueCert(domain string) {
 	IssueLetsEncryptCert(m.Email, domain, m.Location)
 }
 
+// GetChallengeToken is a method for getting challenge token
 func (m *Manager) GetChallengeToken(domain string) string {
 	// m.Location + "/" + domain + "/" + domain + "-acme.json"
 	location := fmt.Sprintf("%s/%s/%s-acme.json", m.Location, domain, domain)
@@ -69,6 +80,7 @@ func (m *Manager) GetChallengeToken(domain string) string {
 	return domainAcme.IssuerData.ChallengeToken
 }
 
+// GetCert is a method for getting tls certificate
 func (m *Manager) GetCert(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 	// m.Location + "/" + domain + "/" + domain + "-cert.crt"
 	location := fmt.Sprintf("%s/%s/%s-cert.crt", m.Location, hello.ServerName, hello.ServerName)
@@ -78,6 +90,23 @@ func (m *Manager) GetCert(hello *tls.ClientHelloInfo) (*tls.Certificate, error) 
 	}
 
 	return &cert, nil
+}
+
+// GetAcmeFileData is a method for getting acme file data
+func (m *Manager) GetAcmeFileData(domain string) (*DomainAcme, error) {
+	// m.Location + "/" + domain + "/" + domain + "-acme.json"
+	location := fmt.Sprintf("%s/%s/%s-acme.json", m.Location, domain, domain)
+	file, err := os.ReadFile(location)
+	if err != nil {
+		return nil, err
+	}
+
+	var domainAcme DomainAcme
+	if err := json.Unmarshal(file, &domainAcme); err != nil {
+		return nil, err
+	}
+
+	return &domainAcme, nil
 }
 
 // HTTPHandler is a http handler for serving acme challenge
@@ -90,14 +119,32 @@ func (m *Manager) HTTPHandler(fallback http.Handler) http.Handler {
 		}
 
 		token := r.URL.Path[len("/.well-known/acme-challenge/"):]
+
+		acmeData, err := m.GetAcmeFileData(r.Host)
+		if err != nil {
+			log.Fatalf("Failed to get acme file data: %v", err)
+		}
+
+		client := &acme.Client{
+			DirectoryURL: acme.LetsEncryptURL,
+			Key:          acmeData.AccountKey,
+		}
+
+		// HTTP-01 challenge response
+		http01, err := client.HTTP01ChallengeResponse(m.GetChallengeToken(r.Host))
+		if err != nil {
+			log.Fatalf("HTTP-01 challenge response failed: %v", err)
+		}
+
 		if token == m.GetChallengeToken(r.Host) {
-			w.Write([]byte(m.GetChallengeToken(r.Host)))
+			w.Write([]byte(http01))
 		} else {
 			fallback.ServeHTTP(w, r)
 		}
 	})
 }
 
+// IssueLetsEncryptCert is a function for issuing letsencrypt certificate
 func IssueLetsEncryptCert(email, domain, location string) {
 	// Generate a new account key
 	accountKey, err := rsa.GenerateKey(rand.Reader, 4096)
@@ -152,6 +199,7 @@ func IssueLetsEncryptCert(email, domain, location string) {
 			URL: acct.URI,
 			Ca:  client.DirectoryURL,
 		},
+		AccountKey: accountKey,
 	}
 
 	// save domainAcme struct to domainAcme.json file
@@ -204,29 +252,6 @@ func IssueLetsEncryptCert(email, domain, location string) {
 	if err := os.WriteFile(domainAcmeFile, jsonData, 0644); err != nil {
 		log.Fatalf("Failed to write domain acme data: %v", err)
 	}
-
-	// HTTP-01 challenge response
-	http01, err := client.HTTP01ChallengeResponse(chal.Token)
-	if err != nil {
-		log.Fatalf("HTTP-01 challenge response failed: %v", err)
-	}
-
-	http.HandleFunc("/.well-known/acme-challenge/", func(w http.ResponseWriter, r *http.Request) {
-		token := r.URL.Path[len("/.well-known/acme-challenge/"):]
-		if token == chal.Token {
-			w.Write([]byte(http01))
-		} else {
-			http.NotFound(w, r)
-		}
-		log.Printf("Request: %s %s", r.Method, r.URL.Path)
-	})
-
-	// Start the HTTP server
-	go func() {
-		if err := http.ListenAndServe(":80", nil); err != nil {
-			log.Fatalf("HTTP server failed: %v", err)
-		}
-	}()
 
 	// Accept the challenge
 	_, err = client.Accept(context.TODO(), chal)
@@ -302,6 +327,19 @@ func IssueLetsEncryptCert(email, domain, location string) {
 	if err := os.WriteFile(keyFile, keyPEM, 0644); err != nil {
 		log.Fatalf("Failed to write key: %v", err)
 	}
+
+	crtFileData, err := os.ReadFile(certFile)
+	if err != nil {
+		log.Fatalf("Failed to read certificate file: %v", err)
+	}
+
+	keyFileData, err := os.ReadFile(keyFile)
+	if err != nil {
+		log.Fatalf("Failed to read key file: %v", err)
+	}
+
+	domainAcme.CertFile = string(crtFileData)
+	domainAcme.KeyFile = string(keyFileData)
 
 	fmt.Println("Certificate and key saved to cert.pem and key.pem")
 }
