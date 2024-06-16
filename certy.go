@@ -206,14 +206,6 @@ func (m *Manager) issueLetsEncryptCert(email, domain, location string) {
 		}
 	}
 
-	// Register a new ACME account
-	acct := &acme.Account{Contact: []string{"mailto:" + email}}
-	acct, err = client.Register(context.TODO(), acct, acme.AcceptTOS)
-	if err != nil {
-		log.Fatalf("Account registration failed: %v", err)
-	}
-	fmt.Printf("Account registered: %v\n", acct.URI)
-
 	// if not exists create domainAcme.json file
 	domainAcmeFile := location + "/" + domain + "-acme.json"
 	if _, err := os.Stat(domainAcmeFile); os.IsNotExist(err) {
@@ -230,6 +222,19 @@ func (m *Manager) issueLetsEncryptCert(email, domain, location string) {
 
 	var domainAcme DomainAcme
 	json.Unmarshal(acmefile, &domainAcme)
+
+	if !domainAcme.IsNull() && !domainAcme.Expired() {
+		log.Println("Certificate is not expired: " + domain)
+		return
+	}
+
+	// Register a new ACME account
+	acct := &acme.Account{Contact: []string{"mailto:" + email}}
+	acct, err = client.Register(context.TODO(), acct, acme.AcceptTOS)
+	if err != nil {
+		log.Fatalf("Account registration failed: %v", err)
+	}
+	fmt.Printf("Account registered: %v\n", acct.URI)
 
 	if domainAcme.IsNull() {
 		// create domainAcme struct
