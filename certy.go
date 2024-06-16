@@ -306,7 +306,7 @@ func (m *Manager) issueLetsEncryptCert(email, domain, location string) {
 		log.Fatalf("Failed to create certificate file: %v", err)
 	}
 
-	file, err := os.OpenFile(domain+"-cert.crt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	file, err := os.OpenFile(certFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		log.Fatalf("Failed to open file: %v", err)
 	}
