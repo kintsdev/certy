@@ -6,6 +6,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/json"
@@ -33,6 +34,62 @@ type IssuerData struct {
 	URL            string `json:"url"`
 	Ca             string `json:"ca"`
 	ChallengeToken string `json:"challenge_token"`
+}
+
+type Manager struct {
+	Email    string
+	Location string
+}
+
+func NewManager(email, location string) *Manager {
+	return &Manager{
+		Email:    email,
+		Location: location,
+	}
+}
+
+func (m *Manager) IssueCert(domain string) {
+	IssueLetsEncryptCert(m.Email, domain, m.Location)
+}
+
+func (m *Manager) GetChallengeToken(domain string) string {
+	// m.Location + "/" + domain + "/" + domain + "-acme.json"
+	location := fmt.Sprintf("%s/%s/%s-acme.json", m.Location, domain, domain)
+	file, err := os.ReadFile(location)
+	if err != nil {
+		log.Fatalf("Failed to read domain acme file: %v", err)
+	}
+
+	var domainAcme DomainAcme
+	if err := json.Unmarshal(file, &domainAcme); err != nil {
+		log.Fatalf("Failed to unmarshal domain acme data: %v", err)
+	}
+
+	return domainAcme.IssuerData.ChallengeToken
+}
+
+func (m *Manager) GetCert(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	// m.Location + "/" + domain + "/" + domain + "-cert.crt"
+	location := fmt.Sprintf("%s/%s/%s-cert.crt", m.Location, hello.ServerName, hello.ServerName)
+	cert, err := tls.LoadX509KeyPair(location, location)
+	if err != nil {
+		return nil, err
+	}
+
+	return &cert, nil
+}
+
+// HTTPHandler is a http handler for serving acme challenge
+func (m *Manager) HTTPHandler(w http.ResponseWriter, r *http.Request) {
+	domain := r.Host
+	token := r.URL.Path[len("/.well-known/acme-challenge/"):]
+	challengeToken := m.GetChallengeToken(domain)
+
+	if token == challengeToken {
+		w.Write([]byte(challengeToken))
+	} else {
+		http.NotFound(w, r)
+	}
 }
 
 func IssueLetsEncryptCert(email, domain, location string) {
