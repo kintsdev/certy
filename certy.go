@@ -36,6 +36,7 @@ type DomainAcme struct {
 	KeyFile    string          `json:"key_file"`
 	ExpireDate time.Time       `json:"expire_date"`
 	IssueDate  time.Time       `json:"issue_date"`
+	CustomCert bool            `json:"custom_cert"`
 }
 
 // Check is need renew certificate or not
@@ -419,4 +420,53 @@ func (m *Manager) issueLetsEncryptCert(email, domain, location string) {
 	}
 
 	fmt.Println("Certificate and key saved to cert.pem and key.pem")
+}
+
+func (m *Manager) AddCustomCert(domain, certFileData, keyfileData string) {
+	location := fmt.Sprintf("%s/%s/%s-acme.json", m.Location, domain, domain)
+
+	if _, err := os.Stat(location); os.IsNotExist(err) {
+		if _, err := os.Create(location); err != nil {
+			log.Fatalf("Failed to create domain acme file: %v", err)
+		}
+	}
+
+	domainAcme := DomainAcme{
+		Sans:       []string{},
+		IssuerData: IssuerData{},
+		CertFile:   certFileData,
+		KeyFile:    keyfileData,
+		CustomCert: true,
+	}
+
+	jsonData, err := json.Marshal(domainAcme)
+	if err != nil {
+		log.Fatalf("Failed to marshal domain acme data: %v", err)
+	}
+
+	if err := os.WriteFile(location, jsonData, 0644); err != nil {
+		log.Fatalf("Failed to write domain acme data: %v", err)
+	}
+
+	certFile := location + "/" + domain + "-cert.crt"
+	keyFile := location + "/" + domain + "-key.pem"
+
+	if _, err := os.Create(certFile); err != nil {
+		log.Fatalf("Failed to create certificate file: %v", err)
+	}
+
+	if _, err := os.Create(keyFile); err != nil {
+		log.Fatalf("Failed to create key file: %v", err)
+	}
+
+	if err := os.WriteFile(certFile, []byte(certFileData), 0644); err != nil {
+		log.Fatalf("Failed to write certificate file: %v", err)
+	}
+
+	if err := os.WriteFile(keyFile, []byte(keyfileData), 0644); err != nil {
+		log.Fatalf("Failed to write key file: %v", err)
+	}
+
+	fmt.Println("Custom certificate and key saved to cert.pem and key.pem")
+
 }
