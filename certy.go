@@ -219,9 +219,6 @@ func (m *Manager) issueLetsEncryptCert(email, domain, location string) {
 	json.Unmarshal(acmefile, &domainAcme)
 
 	if !domainAcme.RenewRequired() {
-		log.Println("Certificate is not required to renew: " + domain)
-		log.Println("Expire date: " + domainAcme.ExpireDate.String())
-		log.Println("Renew date: " + domainAcme.ExpireDate.AddDate(0, 0, -2).String())
 		return
 	}
 
