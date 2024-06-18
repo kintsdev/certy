@@ -109,7 +109,7 @@ func (m *Manager) GetCert(hello *tls.ClientHelloInfo) (*tls.Certificate, error) 
 	key := fmt.Sprintf("%s/%s/%s-key.pem", m.Location, domain, domain)
 
 	if _, err := os.Stat(location); os.IsNotExist(err) {
-		m.IssueCert(domain)
+		return nil, errors.New("domain acme data not found")
 	}
 
 	certFileData, err := os.ReadFile(file)
