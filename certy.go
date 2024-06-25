@@ -450,7 +450,7 @@ func (m *Manager) AddCustomCert(domain, certFileData, keyfileData string) {
 		log.Fatalf("Failed to marshal domain acme data: %v", err)
 	}
 
-	if err := os.WriteFile(location, jsonData, 0644); err != nil {
+	if err := os.WriteFile(acmelocation, jsonData, 0644); err != nil {
 		log.Fatalf("Failed to write domain acme data: %v", err)
 	}
 
