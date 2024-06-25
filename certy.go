@@ -420,6 +420,8 @@ func (m *Manager) issueLetsEncryptCert(email, domain, location string) {
 }
 
 func (m *Manager) AddCustomCert(domain, certFileData, keyfileData string) {
+	os.MkdirAll(m.Location+"/"+domain, 0755)
+
 	location := fmt.Sprintf("%s/%s/%s-acme.json", m.Location, domain, domain)
 
 	if _, err := os.Stat(location); os.IsNotExist(err) {
