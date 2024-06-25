@@ -422,10 +422,17 @@ func (m *Manager) issueLetsEncryptCert(email, domain, location string) {
 func (m *Manager) AddCustomCert(domain, certFileData, keyfileData string) {
 	os.MkdirAll(m.Location+"/"+domain, 0755)
 
-	location := fmt.Sprintf("%s/%s/%s-acme.json", m.Location, domain, domain)
+	location := fmt.Sprintf("%s/%s", m.Location, domain)
+	acmelocation := fmt.Sprintf("%s/%s/%s-acme.json", m.Location, domain, domain)
 
 	if _, err := os.Stat(location); os.IsNotExist(err) {
 		if _, err := os.Create(location); err != nil {
+			log.Fatalf("Failed to create domain acme file: %v", err)
+		}
+	}
+
+	if _, err := os.Stat(acmelocation); os.IsNotExist(err) {
+		if _, err := os.Create(acmelocation); err != nil {
 			log.Fatalf("Failed to create domain acme file: %v", err)
 		}
 	}
