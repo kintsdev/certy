@@ -416,7 +416,7 @@ func (m *Manager) issueLetsEncryptCert(email, domain, location string) {
 		log.Fatalf("Failed to write domain acme data: %v", err)
 	}
 
-	fmt.Println("Certificate and key saved to cert.pem and key.pem")
+	fmt.Println("Certificate and key saved to " + location)
 }
 
 func (m *Manager) AddCustomCert(domain, certFileData, keyfileData string) {
@@ -473,6 +473,5 @@ func (m *Manager) AddCustomCert(domain, certFileData, keyfileData string) {
 		log.Fatalf("Failed to write key file: %v", err)
 	}
 
-	fmt.Println("Custom certificate and key saved to cert.pem and key.pem")
-
+	fmt.Println("Custom certificate and key saved to " + location)
 }
