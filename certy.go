@@ -188,13 +188,6 @@ var issuings = make(map[string]bool)
 // issueLetsEncryptCert is a function for issuing letsencrypt certificate
 func (m *Manager) issueLetsEncryptCert(email, domain, location string) {
 
-	if _, ok := issuings[domain]; ok {
-		log.Println("Issuing already in progress: " + domain)
-		return
-	} else {
-		issuings[domain] = true
-	}
-
 	// check location is exists or not if not create it
 	if _, err := os.Stat(location); os.IsNotExist(err) {
 		if err := os.Mkdir(location, 0755); err != nil {
@@ -231,6 +224,18 @@ func (m *Manager) issueLetsEncryptCert(email, domain, location string) {
 		return
 	}
 
+	if !domainAcme.Expired() {
+		log.Println("Certificate is not expired: " + domain)
+		return
+	}
+
+	if _, ok := issuings[domain]; ok {
+		log.Println("Issuing already in progress: " + domain)
+		return
+	} else {
+		issuings[domain] = true
+	}
+
 	// Generate a new account key
 	accountKey, err := rsa.GenerateKey(rand.Reader, 4096)
 	if err != nil {
@@ -264,11 +269,6 @@ func (m *Manager) issueLetsEncryptCert(email, domain, location string) {
 			},
 			AccountKey: accountKey,
 		}
-	}
-
-	if !domainAcme.Expired() {
-		log.Println("Certificate is not expired: " + domain)
-		return
 	}
 
 	// save domainAcme struct to domainAcme.json file
