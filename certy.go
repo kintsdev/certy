@@ -183,8 +183,17 @@ func (m *Manager) HTTPHandler(fallback http.Handler) http.Handler {
 	})
 }
 
+var issuings = make(map[string]bool)
+
 // issueLetsEncryptCert is a function for issuing letsencrypt certificate
 func (m *Manager) issueLetsEncryptCert(email, domain, location string) {
+
+	if _, ok := issuings[domain]; ok {
+		log.Println("Issuing already in progress: " + domain)
+		return
+	} else {
+		issuings[domain] = true
+	}
 
 	// check location is exists or not if not create it
 	if _, err := os.Stat(location); os.IsNotExist(err) {
@@ -321,6 +330,7 @@ func (m *Manager) issueLetsEncryptCert(email, domain, location string) {
 
 	// Wait for challenge to be valid
 	for {
+		log.Println("Checking challenge status", chal.URI, chal.Status)
 		authz, err := client.GetAuthorization(context.TODO(), chal.URI)
 		if err != nil {
 			log.Printf("Failed to get authorization: %v \n", err)
@@ -332,7 +342,7 @@ func (m *Manager) issueLetsEncryptCert(email, domain, location string) {
 			log.Printf("Challenge failed: %v \n", authz)
 		}
 		// Wait before checking again
-		time.Sleep(2 * time.Second)
+		time.Sleep(10 * time.Second)
 	}
 
 	ecdsaPrivateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
