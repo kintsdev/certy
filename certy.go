@@ -222,7 +222,7 @@ func (m *Manager) issueLetsEncryptCert(email, domain, location string) {
 	}
 	var domainAcme DomainAcme
 
-	if acmefile == nil {
+	if len(acmefile) == 0 {
 		domainAcme = DomainAcme{}
 	} else {
 		if err := json.Unmarshal(acmefile, &domainAcme); err != nil {
