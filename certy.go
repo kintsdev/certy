@@ -232,12 +232,17 @@ func (m *Manager) issueLetsEncryptCert(email, domain, location string) {
 	}
 
 	if !domainAcme.RenewRequired() {
+		log.Println("Certificate is not required to renew: " + domain)
 		return
+	} else {
+		log.Println("Certificate is required to renew: " + domain)
 	}
 
 	if !domainAcme.Expired() {
 		log.Println("Certificate is not expired: " + domain)
 		return
+	} else {
+		log.Println("Certificate is expired: " + domain)
 	}
 
 	if issuings[domain] {
@@ -251,6 +256,8 @@ func (m *Manager) issueLetsEncryptCert(email, domain, location string) {
 	accountKey, err := rsa.GenerateKey(rand.Reader, 4096)
 	if err != nil {
 		log.Println("Account key generation failed: ", err)
+	} else {
+		log.Println("Account key generated")
 	}
 
 	client := &acme.Client{
@@ -262,13 +269,15 @@ func (m *Manager) issueLetsEncryptCert(email, domain, location string) {
 		client.DirectoryURL = letsencryptStagingURL
 	}
 
+	log.Println("manager email: ", email)
 	// Register a new ACME account
 	acct := &acme.Account{Contact: []string{"mailto:" + email}}
 	acct, err = client.Register(context.TODO(), acct, acme.AcceptTOS)
 	if err != nil {
 		log.Println("Account registration failed: ", err)
+	} else {
+		fmt.Printf("Account registered: %v\n", acct.URI)
 	}
-	fmt.Printf("Account registered: %v\n", acct.URI)
 
 	if domainAcme.IsNull() {
 		// create domainAcme struct
@@ -280,11 +289,6 @@ func (m *Manager) issueLetsEncryptCert(email, domain, location string) {
 			},
 			AccountKey: accountKey,
 		}
-	} else {
-		domainAcme.Sans = append(domainAcme.Sans, domain)
-		domainAcme.IssuerData.URL = acct.URI
-		domainAcme.IssuerData.Ca = client.DirectoryURL
-		domainAcme.AccountKey = accountKey
 	}
 
 	// save domainAcme struct to domainAcme.json file
