@@ -272,11 +272,11 @@ func (m *Manager) issueLetsEncryptCert(email, domain, location string) {
 	log.Println("manager email: ", email)
 	// Register a new ACME account
 	acct := &acme.Account{Contact: []string{"mailto:" + email}}
-	acct, err = client.Register(context.TODO(), acct, acme.AcceptTOS)
-	if err != nil {
-		log.Println("Account registration failed: ", err)
+	acct, err2 := client.Register(context.Background(), acct, acme.AcceptTOS)
+	if err2 != nil {
+		log.Println("Account registration failed: ", err2)
 	} else {
-		fmt.Printf("Account registered: %v\n", acct.URI)
+		log.Println("Account registered: ", acct)
 	}
 
 	if domainAcme.IsNull() {
