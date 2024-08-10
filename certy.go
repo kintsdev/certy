@@ -220,11 +220,15 @@ func (m *Manager) issueLetsEncryptCert(email, domain, location string) {
 	if err != nil {
 		log.Println("Failed to read domain acme file: ", err)
 	}
-
 	var domainAcme DomainAcme
-	if err := json.Unmarshal(acmefile, &domainAcme); err != nil {
-		log.Println("Failed to unmarshal domain acme data: ", err)
-		return
+
+	if acmefile == nil {
+		domainAcme = DomainAcme{}
+	} else {
+		if err := json.Unmarshal(acmefile, &domainAcme); err != nil {
+			log.Println("Failed to unmarshal domain acme data: ", err)
+			return
+		}
 	}
 
 	if !domainAcme.RenewRequired() {
