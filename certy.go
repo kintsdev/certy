@@ -288,6 +288,9 @@ func (m *Manager) issueLetsEncryptCert(email, domain, location string) {
 		return
 	}
 
+	log.Println("Saving domain acme data to file: " + domainAcmeFile)
+	log.Println("Domain acme data: ", string(jsonData))
+
 	if err := os.WriteFile(domainAcmeFile, jsonData, 0644); err != nil {
 		log.Println("Failed to write domain acme data: ", err)
 		issuings[domain] = false
