@@ -187,6 +187,10 @@ var issuings = make(map[string]bool)
 
 // issueLetsEncryptCert is a function for issuing letsencrypt certificate
 func (m *Manager) issueLetsEncryptCert(email, domain, location string) {
+	if m == nil {
+		log.Println("Manager is nil")
+		return
+	}
 
 	// check location is exists or not if not create it
 	if _, err := os.Stat(location); os.IsNotExist(err) {
