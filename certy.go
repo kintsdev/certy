@@ -222,7 +222,10 @@ func (m *Manager) issueLetsEncryptCert(email, domain, location string) {
 	}
 
 	var domainAcme DomainAcme
-	json.Unmarshal(acmefile, &domainAcme)
+	if err := json.Unmarshal(acmefile, &domainAcme); err != nil {
+		log.Println("Failed to unmarshal domain acme data: ", err)
+		return
+	}
 
 	if !domainAcme.RenewRequired() {
 		return
@@ -233,7 +236,7 @@ func (m *Manager) issueLetsEncryptCert(email, domain, location string) {
 		return
 	}
 
-	if _, ok := issuings[domain]; ok {
+	if issuings[domain] {
 		log.Println("Issuing already in progress: " + domain)
 		return
 	} else {
