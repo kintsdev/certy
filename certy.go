@@ -232,17 +232,11 @@ func (m *Manager) issueLetsEncryptCert(email, domain, location string) {
 	}
 
 	if !domainAcme.RenewRequired() {
-		log.Println("Certificate is not required to renew: " + domain)
 		return
-	} else {
-		log.Println("Certificate is required to renew: " + domain)
 	}
 
 	if !domainAcme.Expired() {
-		log.Println("Certificate is not expired: " + domain)
 		return
-	} else {
-		log.Println("Certificate is expired: " + domain)
 	}
 
 	if issuings[domain] {
@@ -269,14 +263,11 @@ func (m *Manager) issueLetsEncryptCert(email, domain, location string) {
 		client.DirectoryURL = letsencryptStagingURL
 	}
 
-	log.Println("manager email: ", email)
 	// Register a new ACME account
 	acct := &acme.Account{Contact: []string{"mailto:" + email}}
 	acct, err2 := client.Register(context.Background(), acct, acme.AcceptTOS)
 	if err2 != nil {
 		log.Println("Account registration failed: ", err2)
-	} else {
-		log.Println("Account registered: ", acct)
 	}
 
 	if domainAcme.IsNull() {
@@ -298,9 +289,6 @@ func (m *Manager) issueLetsEncryptCert(email, domain, location string) {
 		issuings[domain] = false
 		return
 	}
-
-	log.Println("Saving domain acme data to file: " + domainAcmeFile)
-	log.Println("Domain acme data: ", string(jsonData))
 
 	if err := os.WriteFile(domainAcmeFile, jsonData, 0644); err != nil {
 		log.Println("Failed to write domain acme data: ", err)
@@ -343,7 +331,6 @@ func (m *Manager) issueLetsEncryptCert(email, domain, location string) {
 	}
 
 	domainAcme.IssuerData.ChallengeToken = chal.Token
-	log.Println("Challenge token: " + chal.Token)
 
 	// save domainAcme struct to domainAcme.json file
 	jsonData, err = json.Marshal(domainAcme)
