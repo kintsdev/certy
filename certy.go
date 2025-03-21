@@ -270,14 +270,28 @@ func (m *Manager) issueLetsEncryptCert(email, domain, location string) error {
 	var domainAcme DomainAcme
 	acmeFile := m.filePath(domain, "-acme.json")
 
+	// Try to read existing acme.json, if it doesn't exist create new one
 	if err := m.readJSON(acmeFile, &domainAcme); err != nil {
 		if !os.IsNotExist(err) {
 			return fmt.Errorf("failed to read acme file: %w", err)
 		}
-		domainAcme = DomainAcme{}
+		// Initialize new domain acme data
+		domainAcme = DomainAcme{
+			Sans:       []string{domain},
+			IssuerData: IssuerData{},
+			IssueDate:  time.Now(),
+			ExpireDate: time.Now().AddDate(0, 0, 88), // Let's Encrypt certificates expire in 90 days
+		}
+		// Create and save initial acme.json
+		if err := m.writeJSON(acmeFile, domainAcme); err != nil {
+			return fmt.Errorf("failed to create initial acme file: %w", err)
+		}
+		log.Printf("Created new acme.json for domain %s", domain)
 	}
 
+	// Check if certificate needs renewal
 	if !domainAcme.RenewRequired() && !domainAcme.Expired() {
+		log.Printf("Certificate for domain %s is still valid, no renewal needed", domain)
 		return nil
 	}
 
@@ -500,59 +514,42 @@ func (m *Manager) issueLetsEncryptCert(email, domain, location string) error {
 	return nil
 }
 
-func (m *Manager) AddCustomCert(domain, certFileData, keyfileData string) {
-	os.MkdirAll(m.Location+"/"+domain, 0755)
-
-	location := fmt.Sprintf("%s/%s", m.Location, domain)
-	acmelocation := fmt.Sprintf("%s/%s/%s-acme.json", m.Location, domain, domain)
-
-	if _, err := os.Stat(location); os.IsNotExist(err) {
-		if _, err := os.Create(location); err != nil {
-			log.Println("Failed to create domain acme file: ", err)
-		}
+func (m *Manager) AddCustomCert(domain, certFileData, keyfileData string) error {
+	// Ensure domain directory exists
+	domainDir := filepath.Join(m.Location, domain)
+	if err := m.ensureDir(domainDir); err != nil {
+		return fmt.Errorf("failed to create domain directory: %w", err)
 	}
 
-	if _, err := os.Stat(acmelocation); os.IsNotExist(err) {
-		if _, err := os.Create(acmelocation); err != nil {
-			log.Println("Failed to create domain acme file: ", err)
-		}
-	}
-
+	// Create and initialize domain acme data
 	domainAcme := DomainAcme{
-		Sans:       []string{},
+		Sans:       []string{domain},
 		IssuerData: IssuerData{},
 		CertFile:   certFileData,
 		KeyFile:    keyfileData,
 		CustomCert: true,
+		IssueDate:  time.Now(),
+		ExpireDate: time.Now().AddDate(0, 0, 365), // Custom certs typically last 1 year
 	}
 
-	jsonData, err := json.Marshal(domainAcme)
-	if err != nil {
-		log.Println("Failed to marshal domain acme data: ", err)
+	// Save domain acme data
+	acmeFile := m.filePath(domain, "-acme.json")
+	if err := m.writeJSON(acmeFile, domainAcme); err != nil {
+		return fmt.Errorf("failed to write domain acme data: %w", err)
 	}
 
-	if err := os.WriteFile(acmelocation, jsonData, 0644); err != nil {
-		log.Println("Failed to write domain acme data: ", err)
+	// Save certificate file
+	certFile := m.filePath(domain, "-cert.crt")
+	if err := os.WriteFile(certFile, []byte(certFileData), 0600); err != nil {
+		return fmt.Errorf("failed to write certificate file: %w", err)
 	}
 
-	certFile := location + "/" + domain + "-cert.crt"
-	keyFile := location + "/" + domain + "-key.pem"
-
-	if _, err := os.Create(certFile); err != nil {
-		log.Println("Failed to create certificate file: ", err)
+	// Save key file
+	keyFile := m.filePath(domain, "-key.pem")
+	if err := os.WriteFile(keyFile, []byte(keyfileData), 0600); err != nil {
+		return fmt.Errorf("failed to write key file: %w", err)
 	}
 
-	if _, err := os.Create(keyFile); err != nil {
-		log.Println("Failed to create key file: ", err)
-	}
-
-	if err := os.WriteFile(certFile, []byte(certFileData), 0644); err != nil {
-		log.Println("Failed to write certificate file: ", err)
-	}
-
-	if err := os.WriteFile(keyFile, []byte(keyfileData), 0644); err != nil {
-		log.Println("Failed to write key file: ", err)
-	}
-
-	fmt.Println("Custom certificate and key saved to " + location)
+	log.Printf("Custom certificate and key saved for domain %s", domain)
+	return nil
 }
