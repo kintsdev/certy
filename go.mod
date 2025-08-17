@@ -1,5 +1,5 @@
 module github.com/kintsdev/certy
 
-go 1.24
+go 1.21
 
-require golang.org/x/crypto v0.41.0
+require golang.org/x/crypto v0.17.0
