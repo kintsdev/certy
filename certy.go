@@ -528,6 +528,5 @@ func (m *Manager) AddCustomCert(domain, certFileData, keyFileData string) error 
 		return fmt.Errorf("failed to write key file: %w", err)
 	}
 
-	log.Printf("Custom certificate and key saved to %s", domainLocation)
 	return nil
 }
