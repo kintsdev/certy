@@ -1,7 +1,15 @@
 package certy
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/json"
+	"encoding/pem"
+	"math/big"
 	"os"
 	"path/filepath"
 	"testing"
@@ -99,7 +107,7 @@ func TestDomainAcme_IsNull(t *testing.T) {
 					URL: "https://example.com",
 					Ca:  "CA",
 				},
-				AccountKey: &rsa.PrivateKey{},
+				AccountKey: rsaPrivateKeyJSON{&rsa.PrivateKey{}},
 				IssueDate:  time.Now(),
 			},
 			expected: false,
@@ -150,8 +158,7 @@ func TestManager_AddCustomCert(t *testing.T) {
 
 	manager := NewManager("test@example.com", tempDir, false)
 	domain := "example.com"
-	certData := "-----BEGIN CERTIFICATE-----\nMOCK_CERT\n-----END CERTIFICATE-----"
-	keyData := "-----BEGIN PRIVATE KEY-----\nMOCK_KEY\n-----END PRIVATE KEY-----"
+	certData, keyData := generateSelfSignedCert(t, domain)
 
 	err = manager.AddCustomCert(domain, certData, keyData)
 	if err != nil {
@@ -175,6 +182,15 @@ func TestManager_AddCustomCert(t *testing.T) {
 		t.Error("Key file was not created")
 	}
 
+	// Verify key file has restrictive permissions
+	keyInfo, err := os.Stat(keyFile)
+	if err != nil {
+		t.Fatalf("Failed to stat key file: %v", err)
+	}
+	if keyInfo.Mode().Perm() != 0600 {
+		t.Errorf("Expected key file permission 0600, got %o", keyInfo.Mode().Perm())
+	}
+
 	// Verify ACME data
 	acmeData, err := manager.GetAcmeFileData(domain)
 	if err != nil {
@@ -187,6 +203,19 @@ func TestManager_AddCustomCert(t *testing.T) {
 
 	if len(acmeData.Sans) != 1 || acmeData.Sans[0] != domain {
 		t.Error("Expected domain in Sans array")
+	}
+
+	// Verify CertFile/KeyFile store paths, not PEM content
+	if acmeData.CertFile != certFile {
+		t.Errorf("Expected CertFile to be path %s, got %s", certFile, acmeData.CertFile)
+	}
+	if acmeData.KeyFile != keyFile {
+		t.Errorf("Expected KeyFile to be path %s, got %s", keyFile, acmeData.KeyFile)
+	}
+
+	// Verify expiry was parsed from the certificate (not hardcoded 1 year)
+	if acmeData.ExpireDate.IsZero() {
+		t.Error("Expected ExpireDate to be set from certificate")
 	}
 }
 
@@ -218,4 +247,147 @@ func TestManager_GetChallengeToken_NotFound(t *testing.T) {
 	if err == nil {
 		t.Error("Expected error for non-existent domain")
 	}
+}
+
+func TestValidateDomain(t *testing.T) {
+	tests := []struct {
+		name    string
+		domain  string
+		wantErr bool
+	}{
+		{"valid domain", "example.com", false},
+		{"valid subdomain", "sub.example.com", false},
+		{"empty domain", "", true},
+		{"path traversal with ..", "../etc/passwd", true},
+		{"path traversal with /", "foo/bar", true},
+		{"path traversal with backslash", "foo\\bar", true},
+		{"null byte", "foo\x00bar", true},
+		{"too long domain", string(make([]byte, 254)), true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateDomain(tt.domain)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("validateDomain(%q) error = %v, wantErr %v", tt.domain, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestRsaPrivateKeyJSON_RoundTrip(t *testing.T) {
+	// Generate a real RSA key
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("Failed to generate RSA key: %v", err)
+	}
+
+	original := DomainAcme{
+		Sans: []string{"example.com"},
+		IssuerData: IssuerData{
+			URL: "https://acme.example.com",
+			Ca:  "https://ca.example.com",
+		},
+		AccountKey: rsaPrivateKeyJSON{key},
+		CertFile:   "/path/to/cert",
+		KeyFile:    "/path/to/key",
+		IssueDate:  time.Now().Truncate(time.Second),
+		ExpireDate: time.Now().Add(90 * 24 * time.Hour).Truncate(time.Second),
+	}
+
+	// Marshal
+	data, err := json.Marshal(original)
+	if err != nil {
+		t.Fatalf("Failed to marshal: %v", err)
+	}
+
+	// Unmarshal
+	var restored DomainAcme
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatalf("Failed to unmarshal: %v", err)
+	}
+
+	// Verify the key survived the round trip
+	if restored.AccountKey.PrivateKey == nil {
+		t.Fatal("AccountKey is nil after round trip")
+	}
+	if restored.AccountKey.D.Cmp(key.D) != 0 {
+		t.Error("AccountKey.D mismatch after round trip")
+	}
+	if restored.AccountKey.N.Cmp(key.N) != 0 {
+		t.Error("AccountKey.N mismatch after round trip")
+	}
+}
+
+func TestRsaPrivateKeyJSON_NilRoundTrip(t *testing.T) {
+	original := DomainAcme{
+		Sans: []string{"example.com"},
+	}
+
+	data, err := json.Marshal(original)
+	if err != nil {
+		t.Fatalf("Failed to marshal: %v", err)
+	}
+
+	var restored DomainAcme
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatalf("Failed to unmarshal: %v", err)
+	}
+
+	if restored.AccountKey.PrivateKey != nil {
+		t.Error("Expected nil AccountKey after round trip with nil key")
+	}
+}
+
+func TestManager_DirectoryURL(t *testing.T) {
+	staging := NewManager("test@example.com", "/tmp", true)
+	if staging.directoryURL() != letsencryptStagingURL {
+		t.Errorf("Expected staging URL, got %s", staging.directoryURL())
+	}
+
+	prod := NewManager("test@example.com", "/tmp", false)
+	if prod.directoryURL() != letsencryptProdURL {
+		t.Errorf("Expected prod URL, got %s", prod.directoryURL())
+	}
+}
+
+func TestManager_AddCustomCert_InvalidDomain(t *testing.T) {
+	manager := NewManager("test@example.com", "/tmp", false)
+
+	err := manager.AddCustomCert("../evil", "cert", "key")
+	if err == nil {
+		t.Error("Expected error for path traversal domain")
+	}
+}
+
+// generateSelfSignedCert generates a self-signed certificate and key PEM for testing.
+func generateSelfSignedCert(t *testing.T, domain string) (certPEM, keyPEM string) {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("Failed to generate key: %v", err)
+	}
+
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: domain},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(365 * 24 * time.Hour),
+	}
+
+	derBytes, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("Failed to create certificate: %v", err)
+	}
+
+	certBlock := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
+
+	keyBytes, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatalf("Failed to marshal key: %v", err)
+	}
+	keyBlock := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyBytes})
+
+	return string(certBlock), string(keyBlock)
 }

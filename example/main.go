@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"log"
@@ -21,7 +22,7 @@ func main() {
 	domain := "example.com"
 	fmt.Printf("Issuing certificate for %s...\n", domain)
 
-	err := manager.IssueCert(domain)
+	err := manager.IssueCert(context.Background(), domain)
 	if err != nil {
 		log.Printf("Failed to issue certificate: %v", err)
 	} else {
