@@ -13,7 +13,7 @@ Certy is a Go library for managing Let's Encrypt SSL/TLS certificates with autom
 - **HTTP-01 Challenge Support**: Built-in ACME challenge handler for domain verification
 - **Custom Certificate Support**: Add your own certificates alongside Let's Encrypt ones
 - **Thread-Safe Operations**: Concurrent certificate issuance with proper locking
-- **Automatic Renewal**: Certificates are renewed 30 days before expiry
+- **Renewal**: `IssueCert` renews certificates within 30 days of expiry and is a no-op otherwise, so it can be called periodically
 - **Staging Environment Support**: Test with Let's Encrypt staging servers first
 
 ## Installation
@@ -30,6 +30,7 @@ go get github.com/kintsdev/certy
 package main
 
 import (
+    "context"
     "log"
     "github.com/kintsdev/certy"
 )
@@ -42,8 +43,9 @@ func main() {
         true,                     // Use staging environment first
     )
 
-    // Issue a certificate for a domain
-    err := manager.IssueCert("example.com")
+    // Issue a certificate for a domain.
+    // HTTPHandler must be serving port 80 for the domain while this runs.
+    err := manager.IssueCert(context.Background(), "example.com")
     if err != nil {
         log.Fatalf("Failed to issue certificate: %v", err)
     }
@@ -65,10 +67,14 @@ import (
 
 func main() {
     manager := certy.NewManager("your-email@example.com", "./certs", false)
-    
-    // Create server with automatic certificate management
+
+    // HTTP-01 challenges are validated over plain HTTP on port 80
+    go func() {
+        log.Fatal(http.ListenAndServe(":80", manager.HTTPHandler(nil)))
+    }()
+
     server := &http.Server{
-        Addr: ":8443",
+        Addr: ":443",
         TLSConfig: &tls.Config{
             GetCertificate: manager.GetCert, // Automatically selects certificates
         },
@@ -76,10 +82,6 @@ func main() {
             fmt.Fprintf(w, "Hello from %s!", r.Host)
         }),
     }
-
-    // Wrap with ACME challenge handler for Let's Encrypt verification
-    handler := manager.HTTPHandler(server.Handler)
-    server.Handler = handler
 
     log.Fatal(server.ListenAndServeTLS("", ""))
 }
@@ -110,16 +112,18 @@ type Manager struct {
     Email    string // Email for Let's Encrypt account
     Location string // Directory to store certificates
     Staging  bool   // Use staging environment
+    Logger   Logger // Optional, anything with Printf (e.g. *log.Logger)
 }
 ```
 
 #### Methods
 
 - `NewManager(email, location string, staging bool) *Manager` - Create a new manager
-- `IssueCert(domain string) error` - Issue a Let's Encrypt certificate
-- `AddCustomCert(domain, certData, keyData string) error` - Add a custom certificate
-- `GetCert(hello *tls.ClientHelloInfo) (*tls.Certificate, error)` - Get TLS certificate for domain
-- `HTTPHandler(fallback http.Handler) http.Handler` - ACME challenge handler
+- `IssueCert(ctx context.Context, domain string) error` - Issue or renew a Let's Encrypt certificate (no-op if still valid)
+- `AddCustomCert(domain, certData, keyData string) error` - Add a custom certificate (key must match the certificate)
+- `GetCert(hello *tls.ClientHelloInfo) (*tls.Certificate, error)` - Get TLS certificate for domain (use as `tls.Config.GetCertificate`)
+- `InvalidateCertCache(domain string)` - Force the next `GetCert` to reload from disk
+- `HTTPHandler(fallback http.Handler) http.Handler` - ACME challenge handler for port 80 (nil fallback responds 404)
 - `GetAcmeFileData(domain string) (*DomainAcme, error)` - Get ACME data for domain
 - `GetChallengeToken(domain string) (string, error)` - Get challenge token for domain
 
@@ -131,7 +135,7 @@ Represents certificate data for a domain.
 type DomainAcme struct {
     Sans       []string        // Subject Alternative Names
     IssuerData IssuerData      // Let's Encrypt issuer information
-    AccountKey *rsa.PrivateKey // Account private key
+    AccountKey rsaPrivateKeyJSON // Account private key (embeds *rsa.PrivateKey)
     CertFile   string          // Certificate file path
     KeyFile    string          // Private key file path
     ExpireDate time.Time       // Certificate expiry date
@@ -152,6 +156,7 @@ Certy creates the following directory structure:
 
 ```
 certs/
+├── account-key.pem              # Let's Encrypt account key, shared by all domains
 ├── example.com/
 │   ├── example.com-acme.json    # ACME data and metadata
 │   ├── example.com-cert.crt     # Certificate chain
@@ -162,40 +167,31 @@ certs/
     └── another-domain.com-key.pem
 ```
 
-## Configuration
+## Let's Encrypt Rate Limits
 
-### Environment Variables
-
-- `CERTY_EMAIL`: Your email for Let's Encrypt (optional, can be set in code)
-- `CERTY_LOCATION`: Certificate storage directory (optional, can be set in code)
-- `CERTY_STAGING`: Use staging environment (optional, defaults to false)
-
-### Let's Encrypt Rate Limits
-
-- **Staging**: 300 new orders per 3 hours, 300 new registrations per 1 hour
-- **Production**: 300 new orders per 3 hours, 300 new registrations per 3 hours
-
-Always test with staging first!
+Let's Encrypt enforces [rate limits](https://letsencrypt.org/docs/rate-limits/). Certy reuses a single
+ACME account for all domains to stay well within the account creation limits. Always test with staging first!
 
 ## Security Considerations
 
-- Private keys are stored with 0644 permissions (readable by owner only)
-- Directories are created with 0755 permissions
+- Private keys, the account key and `*-acme.json` (which contains the account key) are stored with 0600 permissions
+- Certificates are stored with 0644 permissions, directories with 0755
+- Files are written atomically (temp file + rename), so a crash never leaves a partial file
 - Account keys are RSA 4096-bit
 - Certificate keys are ECDSA P-256
-- Certificates expire after 88 days (renewed 30 days before expiry)
+- Certificates are renewed 30 days before expiry
 
 ## Error Handling
 
 All methods return proper errors that should be checked:
 
 ```go
-err := manager.IssueCert("example.com")
+err := manager.IssueCert(ctx, "example.com")
 if err != nil {
     switch {
     case strings.Contains(err.Error(), "already in progress"):
         log.Println("Certificate issuance already in progress")
-    case strings.Contains(err.Error(), "challenge failed"):
+    case strings.Contains(err.Error(), "challenge validation failed"):
         log.Println("Domain verification failed")
     default:
         log.Printf("Unexpected error: %v", err)
@@ -227,19 +223,6 @@ See the `example/` directory for complete working examples.
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Recent Fixes
-
-This version includes several important fixes:
-
-- **Proper error handling**: All errors are now properly returned and handled
-- **Thread safety**: Added mutex protection for concurrent operations
-- **File path security**: Using `filepath.Join` for secure path construction
-- **Resource cleanup**: Proper file handle management and cleanup
-- **Logic fixes**: Corrected certificate renewal logic and validation
-- **Code organization**: Split large functions into smaller, testable functions
-- **Input validation**: Added proper validation for all inputs
-- **Documentation**: Comprehensive comments and examples
 
 ## Support
 

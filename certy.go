@@ -13,6 +13,8 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io/fs"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -34,6 +36,11 @@ const (
 
 	// Certificate renewal threshold (days before expiry)
 	renewalThreshold = 30
+
+	// accountKeyFile holds the ACME account key shared by all domains, stored in Manager.Location.
+	accountKeyFile = "account-key.pem"
+
+	acmeChallengePath = "/.well-known/acme-challenge/"
 )
 
 // rsaPrivateKeyJSON is a JSON-serializable wrapper for rsa.PrivateKey.
@@ -46,12 +53,10 @@ func (k rsaPrivateKeyJSON) MarshalJSON() ([]byte, error) {
 	if k.PrivateKey == nil {
 		return []byte("null"), nil
 	}
-	der, err := x509.MarshalPKCS8PrivateKey(k.PrivateKey)
+	pemData, err := encodeRSAKey(k.PrivateKey)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal RSA private key: %w", err)
+		return nil, err
 	}
-	block := &pem.Block{Type: "PRIVATE KEY", Bytes: der}
-	pemData := pem.EncodeToMemory(block)
 	return json.Marshal(string(pemData))
 }
 
@@ -64,20 +69,36 @@ func (k *rsaPrivateKeyJSON) UnmarshalJSON(data []byte) error {
 		k.PrivateKey = nil
 		return nil
 	}
-	block, _ := pem.Decode([]byte(pemStr))
+	key, err := decodeRSAKey([]byte(pemStr))
+	if err != nil {
+		return err
+	}
+	k.PrivateKey = key
+	return nil
+}
+
+func encodeRSAKey(key *rsa.PrivateKey) ([]byte, error) {
+	der, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal RSA private key: %w", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}), nil
+}
+
+func decodeRSAKey(pemData []byte) (*rsa.PrivateKey, error) {
+	block, _ := pem.Decode(pemData)
 	if block == nil {
-		return errors.New("failed to decode PEM block for account key")
+		return nil, errors.New("failed to decode PEM block for account key")
 	}
 	key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
 	if err != nil {
-		return fmt.Errorf("failed to parse account key: %w", err)
+		return nil, fmt.Errorf("failed to parse account key: %w", err)
 	}
 	rsaKey, ok := key.(*rsa.PrivateKey)
 	if !ok {
-		return errors.New("account key is not RSA")
+		return nil, errors.New("account key is not RSA")
 	}
-	k.PrivateKey = rsaKey
-	return nil
+	return rsaKey, nil
 }
 
 // DomainAcme is a struct for domain acme data
@@ -92,15 +113,15 @@ type DomainAcme struct {
 	CustomCert bool              `json:"custom_cert"`
 }
 
-// RenewRequired checks if certificate needs renewal
+// RenewRequired reports whether the certificate is missing or expires within renewalThreshold days.
 func (d *DomainAcme) RenewRequired() bool {
 	if d.ExpireDate.IsZero() {
 		return true
 	}
-	// Renew 30 days before expiry
 	return time.Now().After(d.ExpireDate.AddDate(0, 0, -renewalThreshold))
 }
 
+// IsNull reports whether no ACME data has been recorded.
 func (d *DomainAcme) IsNull() bool {
 	return d.IssuerData.Ca == "" && d.IssuerData.URL == "" &&
 		d.IssuerData.ChallengeToken == "" && d.AccountKey.PrivateKey == nil &&
@@ -127,15 +148,17 @@ type Logger interface {
 	Printf(format string, v ...interface{})
 }
 
-// Manager is a struct for managing certificates
+// Manager manages certificates. The zero value is usable, but NewManager is preferred.
 type Manager struct {
-	Email     string
-	Location  string
-	Staging   bool
-	Logger    Logger
-	mu        sync.RWMutex
-	issuings  map[string]bool
-	certCache sync.Map // domain -> *tls.Certificate
+	Email    string
+	Location string
+	Staging  bool
+	Logger   Logger
+
+	mu         sync.Mutex // guards accountKey
+	accountKey *rsa.PrivateKey
+	issuing    sync.Map // domain -> struct{}, domains with an issuance in progress
+	certCache  sync.Map // domain -> *tls.Certificate
 }
 
 // NewManager creates a new certificate manager
@@ -144,23 +167,25 @@ func NewManager(email, location string, staging bool) *Manager {
 		Email:    email,
 		Location: location,
 		Staging:  staging,
-		issuings: make(map[string]bool),
 	}
 }
 
-// logf logs a message if a Logger is configured.
 func (m *Manager) logf(format string, v ...interface{}) {
 	if m.Logger != nil {
 		m.Logger.Printf(format, v...)
 	}
 }
 
-// directoryURL returns the ACME directory URL based on the Staging flag.
 func (m *Manager) directoryURL() string {
 	if m.Staging {
 		return letsencryptStagingURL
 	}
 	return letsencryptProdURL
+}
+
+// domainFile returns the path of a domain's file, e.g. <Location>/<domain>/<domain>-acme.json.
+func (m *Manager) domainFile(domain, suffix string) string {
+	return filepath.Join(m.Location, domain, domain+suffix)
 }
 
 // validateDomain checks that the domain name is safe to use as a path component.
@@ -177,73 +202,65 @@ func validateDomain(domain string) error {
 	return nil
 }
 
-// IssueCert issues a Let's Encrypt certificate for the domain
-func (m *Manager) IssueCert(ctx context.Context, domain string) error {
-	if err := validateDomain(domain); err != nil {
-		return err
-	}
-	return m.issueLetsEncryptCert(ctx, m.Email, domain, m.Location)
-}
-
 // GetChallengeToken gets the challenge token for a domain
 func (m *Manager) GetChallengeToken(domain string) (string, error) {
-	if err := validateDomain(domain); err != nil {
+	d, err := m.GetAcmeFileData(domain)
+	if err != nil {
 		return "", err
 	}
-	location := filepath.Join(m.Location, domain, fmt.Sprintf("%s-acme.json", domain))
-
-	file, err := os.ReadFile(location)
-	if err != nil {
-		return "", fmt.Errorf("failed to read domain acme file: %w", err)
-	}
-
-	var domainAcme DomainAcme
-	if err := json.Unmarshal(file, &domainAcme); err != nil {
-		return "", fmt.Errorf("failed to unmarshal domain acme data: %w", err)
-	}
-
-	return domainAcme.IssuerData.ChallengeToken, nil
+	return d.IssuerData.ChallengeToken, nil
 }
 
-// GetCert gets TLS certificate for a domain. Certificates are cached in memory
-// and only reloaded from disk on cache miss.
+// GetAcmeFileData gets acme file data for a domain
+func (m *Manager) GetAcmeFileData(domain string) (*DomainAcme, error) {
+	if err := validateDomain(domain); err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(m.domainFile(domain, "-acme.json"))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read acme file: %w", err)
+	}
+	var d DomainAcme
+	if err := json.Unmarshal(data, &d); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal domain acme data: %w", err)
+	}
+	return &d, nil
+}
+
+// GetCert returns the TLS certificate for the requested server name. It is meant
+// to be used as tls.Config.GetCertificate. Certificates are cached in memory and
+// reloaded from disk on cache miss or when the cached certificate has expired
+// (e.g. renewed by another process).
 func (m *Manager) GetCert(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 	domain := hello.ServerName
 	if err := validateDomain(domain); err != nil {
 		return nil, err
 	}
 
-	// Check in-memory cache first
-	if cached, ok := m.certCache.Load(domain); ok {
-		return cached.(*tls.Certificate), nil
+	if v, ok := m.certCache.Load(domain); ok {
+		cert := v.(*tls.Certificate)
+		if cert.Leaf == nil || time.Now().Before(cert.Leaf.NotAfter) {
+			return cert, nil
+		}
 	}
 
-	location := filepath.Join(m.Location, domain, fmt.Sprintf("%s-acme.json", domain))
-	certFile := filepath.Join(m.Location, domain, fmt.Sprintf("%s-cert.crt", domain))
-	keyFile := filepath.Join(m.Location, domain, fmt.Sprintf("%s-key.pem", domain))
-
-	if _, err := os.Stat(location); os.IsNotExist(err) {
+	if _, err := os.Stat(m.domainFile(domain, "-acme.json")); err != nil {
 		return nil, fmt.Errorf("domain acme data not found for %s", domain)
 	}
-
-	certFileData, err := os.ReadFile(certFile)
+	certPEM, err := os.ReadFile(m.domainFile(domain, "-cert.crt"))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read certificate file: %w", err)
 	}
-
-	keyFileData, err := os.ReadFile(keyFile)
+	keyPEM, err := os.ReadFile(m.domainFile(domain, "-key.pem"))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read key file: %w", err)
 	}
-
-	cert, err := tls.X509KeyPair(certFileData, keyFileData)
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get x509 key pair: %w", err)
 	}
 
-	// Store in cache
 	m.certCache.Store(domain, &cert)
-
 	return &cert, nil
 }
 
@@ -253,316 +270,264 @@ func (m *Manager) InvalidateCertCache(domain string) {
 	m.certCache.Delete(domain)
 }
 
-// GetAcmeFileData gets acme file data for a domain
-func (m *Manager) GetAcmeFileData(domain string) (*DomainAcme, error) {
-	if err := validateDomain(domain); err != nil {
-		return nil, err
-	}
-	location := filepath.Join(m.Location, domain, fmt.Sprintf("%s-acme.json", domain))
-
-	file, err := os.ReadFile(location)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read acme file: %w", err)
-	}
-
-	var domainAcme DomainAcme
-	if err := json.Unmarshal(file, &domainAcme); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal domain acme data: %w", err)
-	}
-
-	return &domainAcme, nil
-}
-
-// HTTPHandler is a http handler for serving acme challenge
+// HTTPHandler serves HTTP-01 ACME challenges and passes every other request to
+// fallback. It must be reachable over plain HTTP on port 80. A nil fallback
+// responds with 404.
 func (m *Manager) HTTPHandler(fallback http.Handler) http.Handler {
+	if fallback == nil {
+		fallback = http.NotFoundHandler()
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Check if request path has acme challenge
-		if !strings.HasPrefix(r.URL.Path, "/.well-known/acme-challenge/") {
+		if !strings.HasPrefix(r.URL.Path, acmeChallengePath) {
 			fallback.ServeHTTP(w, r)
 			return
 		}
 
-		token := r.URL.Path[len("/.well-known/acme-challenge/"):]
+		token := strings.TrimPrefix(r.URL.Path, acmeChallengePath)
 		if token == "" {
 			http.Error(w, "Empty challenge token", http.StatusBadRequest)
 			return
 		}
 
-		acmeData, err := m.GetAcmeFileData(r.Host)
+		host := r.Host
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+
+		acmeData, err := m.GetAcmeFileData(host)
 		if err != nil {
-			m.logf("Failed to get acme file data for %s: %v", r.Host, err)
+			m.logf("Failed to get acme file data for %s: %v", host, err)
 			http.Error(w, "Domain not found", http.StatusNotFound)
 			return
 		}
-
 		if acmeData.AccountKey.PrivateKey == nil {
 			http.Error(w, "Invalid account key", http.StatusInternalServerError)
 			return
 		}
 
-		client := &acme.Client{
-			DirectoryURL: m.directoryURL(),
-			Key:          acmeData.AccountKey.PrivateKey,
-		}
-
-		// HTTP-01 challenge response
-		http01, err := client.HTTP01ChallengeResponse(token)
+		client := &acme.Client{DirectoryURL: m.directoryURL(), Key: acmeData.AccountKey.PrivateKey}
+		resp, err := client.HTTP01ChallengeResponse(token)
 		if err != nil {
-			m.logf("HTTP-01 challenge response failed for %s: %v", r.Host, err)
+			m.logf("HTTP-01 challenge response failed for %s: %v", host, err)
 			http.Error(w, "Challenge failed", http.StatusInternalServerError)
 			return
 		}
 
 		w.Header().Set("Content-Type", "text/plain")
-		w.Write([]byte(http01))
+		w.Write([]byte(resp))
 	})
 }
 
-// isIssuing checks if certificate issuance is already in progress
-func (m *Manager) isIssuing(domain string) bool {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.issuings[domain]
-}
-
-// setIssuing sets the issuing status for a domain
-func (m *Manager) setIssuing(domain string, status bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.issuings[domain] = status
-}
-
-// issueLetsEncryptCert issues a Let's Encrypt certificate
-func (m *Manager) issueLetsEncryptCert(ctx context.Context, email, domain, location string) error {
-	if m == nil {
-		return errors.New("manager is nil")
+// IssueCert issues a Let's Encrypt certificate for the domain, or renews it if
+// it expires within 30 days. It is a no-op when the current certificate is
+// still valid, so it is safe to call periodically. HTTPHandler must be serving
+// port 80 for the domain while this runs.
+func (m *Manager) IssueCert(ctx context.Context, domain string) error {
+	if err := validateDomain(domain); err != nil {
+		return err
 	}
 
-	// Check if already issuing
-	if m.isIssuing(domain) {
+	if _, busy := m.issuing.LoadOrStore(domain, struct{}{}); busy {
 		return fmt.Errorf("issuing already in progress for domain: %s", domain)
 	}
+	defer m.issuing.Delete(domain)
 
-	m.setIssuing(domain, true)
-	defer m.setIssuing(domain, false)
-
-	// Create base location directory
-	if err := os.MkdirAll(location, dirPerm); err != nil {
-		return fmt.Errorf("failed to create base directory: %w", err)
+	d, err := m.GetAcmeFileData(domain)
+	if err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			// Unreadable or corrupt data must not block issuance forever; start fresh.
+			m.logf("Ignoring unreadable acme data for %s: %v", domain, err)
+		}
+		d = &DomainAcme{}
+	}
+	if !d.RenewRequired() {
+		return nil
 	}
 
-	// Create domain directory
-	domainLocation := filepath.Join(location, domain)
-	if err := os.MkdirAll(domainLocation, dirPerm); err != nil {
+	if err := os.MkdirAll(filepath.Join(m.Location, domain), dirPerm); err != nil {
 		return fmt.Errorf("failed to create domain directory: %w", err)
 	}
 
-	// Check existing certificate
-	domainAcmeFile := filepath.Join(domainLocation, fmt.Sprintf("%s-acme.json", domain))
-	var domainAcme DomainAcme
-
-	if _, err := os.Stat(domainAcmeFile); err == nil {
-		// File exists, read it
-		acmefile, err := os.ReadFile(domainAcmeFile)
-		if err != nil {
-			return fmt.Errorf("failed to read domain acme file: %w", err)
-		}
-
-		if len(acmefile) > 0 {
-			if err := json.Unmarshal(acmefile, &domainAcme); err != nil {
-				return fmt.Errorf("failed to unmarshal domain acme data: %w", err)
-			}
-		}
-	}
-
-	// Check if renewal is needed
-	if !domainAcme.RenewRequired() && !domainAcme.Expired() {
-		return nil // Certificate is still valid
-	}
-
-	// Generate a new account key
-	accountKey, err := rsa.GenerateKey(rand.Reader, 4096)
+	accountKey, err := m.getAccountKey()
 	if err != nil {
-		return fmt.Errorf("account key generation failed: %w", err)
+		return err
 	}
 
-	client := &acme.Client{
-		DirectoryURL: m.directoryURL(),
-		Key:          accountKey,
+	client := &acme.Client{DirectoryURL: m.directoryURL(), Key: accountKey}
+	acct := &acme.Account{}
+	if m.Email != "" {
+		acct.Contact = []string{"mailto:" + m.Email}
 	}
-
-	// Register a new ACME account
-	acct := &acme.Account{Contact: []string{"mailto:" + email}}
-	acct, err = client.Register(ctx, acct, acme.AcceptTOS)
-	if err != nil {
+	if _, err := client.Register(ctx, acct, acme.AcceptTOS); err != nil && !errors.Is(err, acme.ErrAccountAlreadyExists) {
 		return fmt.Errorf("account registration failed: %w", err)
 	}
 
-	if domainAcme.IsNull() {
-		domainAcme = DomainAcme{
-			Sans: []string{domain},
-			IssuerData: IssuerData{
-				URL: acct.URI,
-				Ca:  client.DirectoryURL,
-			},
-			AccountKey: rsaPrivateKeyJSON{accountKey},
-		}
-	} else {
-		domainAcme.AccountKey = rsaPrivateKeyJSON{accountKey}
+	// Persist the account key before validation: HTTPHandler reads it to answer the challenge.
+	d.Sans = []string{domain}
+	d.IssuerData = IssuerData{URL: string(client.KID), Ca: client.DirectoryURL}
+	d.AccountKey = rsaPrivateKeyJSON{accountKey}
+	if err := m.saveDomainAcme(domain, d); err != nil {
+		return err
 	}
 
-	// Save domainAcme struct
-	if err := m.saveDomainAcme(domainAcmeFile, domainAcme); err != nil {
-		return fmt.Errorf("failed to save domain acme data: %w", err)
-	}
-
-	// Create a new order for the domain
 	order, err := client.AuthorizeOrder(ctx, acme.DomainIDs(domain))
 	if err != nil {
 		return fmt.Errorf("order authorization failed: %w", err)
 	}
 
-	// Find HTTP-01 challenge
-	chal, err := m.findHTTP01Challenge(ctx, client, order)
-	if err != nil {
-		return fmt.Errorf("failed to find HTTP-01 challenge: %w", err)
+	for _, authzURL := range order.AuthzURLs {
+		if err := m.authorize(ctx, client, authzURL, domain, d); err != nil {
+			return err
+		}
 	}
 
-	// Update challenge token
-	domainAcme.IssuerData.ChallengeToken = chal.Token
-	if err := m.saveDomainAcme(domainAcmeFile, domainAcme); err != nil {
-		return fmt.Errorf("failed to save challenge token: %w", err)
+	if _, err := client.WaitOrder(ctx, order.URI); err != nil {
+		return fmt.Errorf("order not ready: %w", err)
 	}
 
-	// Accept the challenge
-	_, err = client.Accept(ctx, chal)
-	if err != nil {
-		return fmt.Errorf("challenge acceptance failed: %w", err)
-	}
-
-	// Wait for authorization to be valid
-	_, err = client.WaitAuthorization(ctx, chal.URI)
-	if err != nil {
-		return fmt.Errorf("challenge validation failed: %w", err)
-	}
-
-	// Generate ECDSA key pair
-	ecdsaPrivateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	certKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return fmt.Errorf("ECDSA private key generation failed: %w", err)
 	}
-
-	// Create CSR
 	csr, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{
-		Subject: pkix.Name{CommonName: domain},
-	}, ecdsaPrivateKey)
+		Subject:  pkix.Name{CommonName: domain},
+		DNSNames: []string{domain},
+	}, certKey)
 	if err != nil {
 		return fmt.Errorf("certificate request creation failed: %w", err)
 	}
 
-	// Finalize the order and get the certificate
 	der, _, err := client.CreateOrderCert(ctx, order.FinalizeURL, csr, true)
 	if err != nil {
 		return fmt.Errorf("certificate issuance failed: %w", err)
 	}
-
-	// Save certificate and key files
-	certFile := filepath.Join(domainLocation, fmt.Sprintf("%s-cert.crt", domain))
-	keyFile := filepath.Join(domainLocation, fmt.Sprintf("%s-key.pem", domain))
-
-	if err := m.saveCertificateChain(certFile, der); err != nil {
-		return fmt.Errorf("failed to save certificate: %w", err)
+	if len(der) == 0 {
+		return errors.New("certificate issuance failed: empty certificate chain")
 	}
-
-	if err := m.savePrivateKey(keyFile, ecdsaPrivateKey); err != nil {
-		return fmt.Errorf("failed to save private key: %w", err)
-	}
-
-	// Parse real expiry from the leaf certificate
-	leafCert, err := x509.ParseCertificate(der[0])
+	leaf, err := x509.ParseCertificate(der[0])
 	if err != nil {
 		return fmt.Errorf("failed to parse issued certificate: %w", err)
 	}
 
-	// Update domainAcme with new certificate info
-	domainAcme.CertFile = certFile
-	domainAcme.KeyFile = keyFile
-	domainAcme.ExpireDate = leafCert.NotAfter
-	domainAcme.IssueDate = leafCert.NotBefore
-
-	// Save final domainAcme struct
-	if err := m.saveDomainAcme(domainAcmeFile, domainAcme); err != nil {
-		return fmt.Errorf("failed to save final domain acme data: %w", err)
+	var certPEM []byte
+	for _, c := range der {
+		certPEM = append(certPEM, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: c})...)
 	}
-
-	// Invalidate cached cert so the new one is loaded on next TLS handshake
-	m.InvalidateCertCache(domain)
-
-	m.logf("Certificate and key saved to %s", domainLocation)
-	return nil
-}
-
-// findHTTP01Challenge finds HTTP-01 challenge in the order
-func (m *Manager) findHTTP01Challenge(ctx context.Context, client *acme.Client, order *acme.Order) (*acme.Challenge, error) {
-	for _, authzURL := range order.AuthzURLs {
-		authz, err := client.GetAuthorization(ctx, authzURL)
-		if err != nil {
-			continue
-		}
-
-		for _, c := range authz.Challenges {
-			if c.Type == "http-01" {
-				return c, nil
-			}
-		}
-	}
-	return nil, errors.New("no HTTP-01 challenge found")
-}
-
-// saveDomainAcme saves domain acme data to file
-func (m *Manager) saveDomainAcme(filename string, data DomainAcme) error {
-	jsonData, err := json.MarshalIndent(data, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal domain acme data: %w", err)
-	}
-
-	if err := os.WriteFile(filename, jsonData, certPerm); err != nil {
-		return fmt.Errorf("failed to write domain acme data: %w", err)
-	}
-
-	return nil
-}
-
-// saveCertificateChain saves certificate chain to file
-func (m *Manager) saveCertificateChain(filename string, der [][]byte) error {
-	file, err := os.OpenFile(filename, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, certPerm)
-	if err != nil {
-		return fmt.Errorf("failed to create certificate file: %w", err)
-	}
-	defer file.Close()
-
-	for _, cert := range der {
-		block := &pem.Block{Type: "CERTIFICATE", Bytes: cert}
-		if err := pem.Encode(file, block); err != nil {
-			return fmt.Errorf("failed to write certificate: %w", err)
-		}
-	}
-
-	return nil
-}
-
-// savePrivateKey saves private key to file
-func (m *Manager) savePrivateKey(filename string, key *ecdsa.PrivateKey) error {
-	keyBytes, err := x509.MarshalECPrivateKey(key)
+	keyDER, err := x509.MarshalECPrivateKey(certKey)
 	if err != nil {
 		return fmt.Errorf("failed to marshal ECDSA private key: %w", err)
 	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
 
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyBytes})
-	if err := os.WriteFile(filename, keyPEM, keyPerm); err != nil {
-		return fmt.Errorf("failed to write key: %w", err)
+	certFile := m.domainFile(domain, "-cert.crt")
+	keyFile := m.domainFile(domain, "-key.pem")
+	if err := writeFileAtomic(keyFile, keyPEM, keyPerm); err != nil {
+		return fmt.Errorf("failed to save private key: %w", err)
+	}
+	if err := writeFileAtomic(certFile, certPEM, certPerm); err != nil {
+		return fmt.Errorf("failed to save certificate: %w", err)
 	}
 
+	d.CertFile = certFile
+	d.KeyFile = keyFile
+	d.ExpireDate = leaf.NotAfter
+	d.IssueDate = leaf.NotBefore
+	d.CustomCert = false
+	if err := m.saveDomainAcme(domain, d); err != nil {
+		return err
+	}
+
+	m.InvalidateCertCache(domain)
+	m.logf("Certificate and key saved to %s", filepath.Dir(certFile))
+	return nil
+}
+
+// authorize completes the HTTP-01 challenge for one authorization, unless it is already valid.
+func (m *Manager) authorize(ctx context.Context, client *acme.Client, authzURL, domain string, d *DomainAcme) error {
+	authz, err := client.GetAuthorization(ctx, authzURL)
+	if err != nil {
+		return fmt.Errorf("failed to get authorization: %w", err)
+	}
+	if authz.Status == acme.StatusValid {
+		return nil
+	}
+
+	var chal *acme.Challenge
+	for _, c := range authz.Challenges {
+		if c.Type == "http-01" {
+			chal = c
+			break
+		}
+	}
+	if chal == nil {
+		return errors.New("no HTTP-01 challenge found")
+	}
+
+	d.IssuerData.ChallengeToken = chal.Token
+	if err := m.saveDomainAcme(domain, d); err != nil {
+		return err
+	}
+
+	if _, err := client.Accept(ctx, chal); err != nil {
+		return fmt.Errorf("challenge acceptance failed: %w", err)
+	}
+	if _, err := client.WaitAuthorization(ctx, authz.URI); err != nil {
+		return fmt.Errorf("challenge validation failed: %w", err)
+	}
+	return nil
+}
+
+// getAccountKey loads the shared ACME account key from disk, creating it on
+// first use. Reusing one account avoids Let's Encrypt's account creation rate limits.
+func (m *Manager) getAccountKey() (*rsa.PrivateKey, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.accountKey != nil {
+		return m.accountKey, nil
+	}
+
+	path := filepath.Join(m.Location, accountKeyFile)
+	data, err := os.ReadFile(path)
+	switch {
+	case err == nil:
+		key, err := decodeRSAKey(data)
+		if err != nil {
+			return nil, fmt.Errorf("invalid account key file %s: %w", path, err)
+		}
+		m.accountKey = key
+		return key, nil
+	case !errors.Is(err, fs.ErrNotExist):
+		return nil, fmt.Errorf("failed to read account key: %w", err)
+	}
+
+	key, err := rsa.GenerateKey(rand.Reader, 4096)
+	if err != nil {
+		return nil, fmt.Errorf("account key generation failed: %w", err)
+	}
+	pemData, err := encodeRSAKey(key)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(m.Location, dirPerm); err != nil {
+		return nil, fmt.Errorf("failed to create base directory: %w", err)
+	}
+	if err := writeFileAtomic(path, pemData, keyPerm); err != nil {
+		return nil, fmt.Errorf("failed to save account key: %w", err)
+	}
+	m.accountKey = key
+	return key, nil
+}
+
+// saveDomainAcme writes the domain's acme data. It contains the account key, so it is not world-readable.
+func (m *Manager) saveDomainAcme(domain string, d *DomainAcme) error {
+	data, err := json.MarshalIndent(d, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal domain acme data: %w", err)
+	}
+	if err := writeFileAtomic(m.domainFile(domain, "-acme.json"), data, keyPerm); err != nil {
+		return fmt.Errorf("failed to write domain acme data: %w", err)
+	}
 	return nil
 }
 
@@ -572,56 +537,70 @@ func (m *Manager) AddCustomCert(domain, certPEM, keyPEM string) error {
 		return err
 	}
 
-	domainLocation := filepath.Join(m.Location, domain)
+	// Validates that the key matches the certificate and parses the leaf for its dates.
+	pair, err := tls.X509KeyPair([]byte(certPEM), []byte(keyPEM))
+	if err != nil {
+		return fmt.Errorf("invalid certificate or key: %w", err)
+	}
+	leaf := pair.Leaf
+	if leaf == nil {
+		if leaf, err = x509.ParseCertificate(pair.Certificate[0]); err != nil {
+			return fmt.Errorf("failed to parse certificate: %w", err)
+		}
+	}
 
-	// Create domain directory
-	if err := os.MkdirAll(domainLocation, dirPerm); err != nil {
+	if err := os.MkdirAll(filepath.Join(m.Location, domain), dirPerm); err != nil {
 		return fmt.Errorf("failed to create domain directory: %w", err)
 	}
 
-	// Parse the certificate to extract the real expiry date
-	block, _ := pem.Decode([]byte(certPEM))
-	if block == nil {
-		return errors.New("failed to decode certificate PEM")
+	certFile := m.domainFile(domain, "-cert.crt")
+	keyFile := m.domainFile(domain, "-key.pem")
+	if err := writeFileAtomic(keyFile, []byte(keyPEM), keyPerm); err != nil {
+		return fmt.Errorf("failed to write key file: %w", err)
 	}
-	parsedCert, err := x509.ParseCertificate(block.Bytes)
-	if err != nil {
-		return fmt.Errorf("failed to parse certificate: %w", err)
-	}
-
-	// Save certificate and key files
-	certFile := filepath.Join(domainLocation, fmt.Sprintf("%s-cert.crt", domain))
-	keyFile := filepath.Join(domainLocation, fmt.Sprintf("%s-key.pem", domain))
-
-	if err := os.WriteFile(certFile, []byte(certPEM), certPerm); err != nil {
+	if err := writeFileAtomic(certFile, []byte(certPEM), certPerm); err != nil {
 		return fmt.Errorf("failed to write certificate file: %w", err)
 	}
 
-	if err := os.WriteFile(keyFile, []byte(keyPEM), keyPerm); err != nil {
-		return fmt.Errorf("failed to write key file: %w", err)
-	}
-
-	// Create acme file location
-	acmeLocation := filepath.Join(domainLocation, fmt.Sprintf("%s-acme.json", domain))
-
-	// Create domainAcme struct — store file paths, not PEM content
-	domainAcme := DomainAcme{
+	d := &DomainAcme{
 		Sans:       []string{domain},
-		IssuerData: IssuerData{},
 		CertFile:   certFile,
 		KeyFile:    keyFile,
 		CustomCert: true,
-		ExpireDate: parsedCert.NotAfter,
-		IssueDate:  parsedCert.NotBefore,
+		ExpireDate: leaf.NotAfter,
+		IssueDate:  leaf.NotBefore,
+	}
+	if err := m.saveDomainAcme(domain, d); err != nil {
+		return err
 	}
 
-	// Save acme data
-	if err := m.saveDomainAcme(acmeLocation, domainAcme); err != nil {
-		return fmt.Errorf("failed to save domain acme data: %w", err)
-	}
-
-	// Invalidate cached cert so the new one is loaded on next TLS handshake
 	m.InvalidateCertCache(domain)
-
 	return nil
+}
+
+// writeFileAtomic writes data to a temp file and renames it over name, so
+// readers never observe a partially written file.
+func writeFileAtomic(name string, data []byte, perm os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(name), filepath.Base(name)+".tmp*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name()) // no-op after a successful rename
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), name)
 }

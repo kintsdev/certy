@@ -1,17 +1,22 @@
 package certy
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
 	"math/big"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -141,10 +146,6 @@ func TestNewManager(t *testing.T) {
 
 	if manager.Staging != staging {
 		t.Errorf("Expected staging %v, got %v", staging, manager.Staging)
-	}
-
-	if manager.issuings == nil {
-		t.Error("Expected issuings map to be initialized")
 	}
 }
 
@@ -390,4 +391,186 @@ func generateSelfSignedCert(t *testing.T, domain string) (certPEM, keyPEM string
 	keyBlock := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyBytes})
 
 	return string(certBlock), string(keyBlock)
+}
+
+func TestManager_AddCustomCert_Permissions(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager("test@example.com", dir, false)
+	certPEM, keyPEM := generateSelfSignedCert(t, "example.com")
+	if err := m.AddCustomCert("example.com", certPEM, keyPEM); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(m.domainFile("example.com", "-acme.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0600 {
+		t.Errorf("acme file permission = %o, want 0600", info.Mode().Perm())
+	}
+}
+
+func TestManager_AddCustomCert_KeyMismatch(t *testing.T) {
+	m := NewManager("test@example.com", t.TempDir(), false)
+	certPEM, _ := generateSelfSignedCert(t, "example.com")
+	_, otherKey := generateSelfSignedCert(t, "example.com")
+	if err := m.AddCustomCert("example.com", certPEM, otherKey); err == nil {
+		t.Error("expected error for mismatched key")
+	}
+	if _, err := os.Stat(m.domainFile("example.com", "-cert.crt")); !os.IsNotExist(err) {
+		t.Error("certificate must not be written when validation fails")
+	}
+}
+
+func TestManager_GetCert(t *testing.T) {
+	m := NewManager("test@example.com", t.TempDir(), false)
+	certPEM, keyPEM := generateSelfSignedCert(t, "example.com")
+	if err := m.AddCustomCert("example.com", certPEM, keyPEM); err != nil {
+		t.Fatal(err)
+	}
+
+	hello := &tls.ClientHelloInfo{ServerName: "example.com"}
+	first, err := m.GetCert(hello)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := m.GetCert(hello)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != second {
+		t.Error("expected cached certificate on second call")
+	}
+
+	// An expired cached certificate is reloaded from disk.
+	expired := *first
+	expired.Leaf = &x509.Certificate{NotAfter: time.Now().Add(-time.Hour)}
+	m.certCache.Store("example.com", &expired)
+	reloaded, err := m.GetCert(hello)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded == &expired {
+		t.Error("expected expired cached certificate to be reloaded")
+	}
+
+	if _, err := m.GetCert(&tls.ClientHelloInfo{ServerName: "unknown.com"}); err == nil {
+		t.Error("expected error for unknown domain")
+	}
+}
+
+func TestManager_IssueCert_ValidCertIsNoop(t *testing.T) {
+	m := NewManager("test@example.com", t.TempDir(), false)
+	certPEM, keyPEM := generateSelfSignedCert(t, "example.com") // valid for a year
+	if err := m.AddCustomCert("example.com", certPEM, keyPEM); err != nil {
+		t.Fatal(err)
+	}
+	// Would hit the network (and fail) if it attempted issuance.
+	if err := m.IssueCert(context.Background(), "example.com"); err != nil {
+		t.Errorf("IssueCert on valid cert = %v, want nil", err)
+	}
+}
+
+func TestManager_IssueCert_InProgress(t *testing.T) {
+	m := NewManager("test@example.com", t.TempDir(), false)
+	m.issuing.Store("example.com", struct{}{})
+	err := m.IssueCert(context.Background(), "example.com")
+	if err == nil || !strings.Contains(err.Error(), "already in progress") {
+		t.Errorf("IssueCert = %v, want already in progress error", err)
+	}
+}
+
+func TestManager_GetAccountKey_Reused(t *testing.T) {
+	dir := t.TempDir()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pemData, err := encodeRSAKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, accountKeyFile), pemData, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := NewManager("test@example.com", dir, false).getAccountKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Equal(key) {
+		t.Error("expected existing account key to be loaded from disk")
+	}
+}
+
+func TestManager_HTTPHandler(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager("test@example.com", dir, true)
+
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "example.com"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.saveDomainAcme("example.com", &DomainAcme{AccountKey: rsaPrivateKeyJSON{key}}); err != nil {
+		t.Fatal(err)
+	}
+
+	fallback := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTeapot)
+	})
+	h := m.HTTPHandler(fallback)
+
+	serve := func(host, path string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "http://"+host+path, nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	if rec := serve("example.com", "/"); rec.Code != http.StatusTeapot {
+		t.Errorf("non-challenge request: got %d, want fallback", rec.Code)
+	}
+	for _, host := range []string{"example.com", "example.com:80"} {
+		rec := serve(host, "/.well-known/acme-challenge/token123")
+		if rec.Code != http.StatusOK || !strings.HasPrefix(rec.Body.String(), "token123.") {
+			t.Errorf("host %q: got %d %q, want key authorization", host, rec.Code, rec.Body.String())
+		}
+	}
+	if rec := serve("unknown.com", "/.well-known/acme-challenge/token123"); rec.Code != http.StatusNotFound {
+		t.Errorf("unknown domain: got %d, want 404", rec.Code)
+	}
+	rec := httptest.NewRecorder()
+	m.HTTPHandler(nil).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://example.com/", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("nil fallback: got %d, want 404", rec.Code)
+	}
+}
+
+func TestWriteFileAtomic(t *testing.T) {
+	name := filepath.Join(t.TempDir(), "file")
+	for _, content := range []string{"first", "second"} {
+		if err := writeFileAtomic(name, []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+		got, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != content {
+			t.Errorf("content = %q, want %q", got, content)
+		}
+	}
+	info, err := os.Stat(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0644 {
+		t.Errorf("permission = %o, want 0644", info.Mode().Perm())
+	}
+	entries, _ := os.ReadDir(filepath.Dir(name))
+	if len(entries) != 1 {
+		t.Errorf("expected no leftover temp files, got %d entries", len(entries))
+	}
 }
